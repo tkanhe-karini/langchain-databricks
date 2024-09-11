@@ -314,7 +314,11 @@ class ChatDatabricks(BaseChatModel):
                 generation_info = {}
                 if finish_reason := choice.get("finish_reason"):
                     generation_info["finish_reason"] = finish_reason
-                    generation_info["usage_metadata"] = chunk["usage"]
+                    # Azure openai does not provide usage metadata for streaming
+                    try:
+                        generation_info["usage_metadata"] = chunk["usage"]
+                    except:
+                        pass
                 if logprobs := choice.get("logprobs"):
                     generation_info["logprobs"] = logprobs
 
