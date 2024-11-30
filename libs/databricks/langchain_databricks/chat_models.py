@@ -2,6 +2,7 @@
 
 import json
 import logging
+from operator import itemgetter
 from typing import (
     Any,
     Callable,
@@ -34,20 +35,23 @@ from langchain_core.messages import (
     ToolMessage,
     ToolMessageChunk,
 )
+from langchain_core.messages.ai import UsageMetadata
 from langchain_core.messages.tool import tool_call_chunk
+from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
+from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.output_parsers.openai_tools import (
+    JsonOutputKeyToolsParser,
+    PydanticToolsParser,
     make_invalid_tool_call,
     parse_tool_call,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.pydantic_v1 import (
-    BaseModel,
-    Field,
-    PrivateAttr,
-)
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils.pydantic import is_basemodel_subclass
+from mlflow.deployments import BaseDeploymentClient  # type: ignore
+from pydantic import BaseModel, Field
 
 from langchain_databricks.utils import get_deployment_client
 
@@ -154,6 +158,30 @@ class ChatDatabricks(BaseChatModel):
                 id='run-4cef851f-6223-424f-ad26-4a54e5852aa5'
             )
 
+        To get token usage returned when streaming, pass the ``stream_usage`` kwarg:
+
+        .. code-block:: python
+
+            stream = llm.stream(messages, stream_usage=True)
+            next(stream).usage_metadata
+
+        .. code-block:: python
+
+            {"input_tokens": 28, "output_tokens": 5, "total_tokens": 33}
+
+        Alternatively, setting ``stream_usage`` when instantiating the model can be
+        useful when incorporating ``ChatDatabricks`` into LCEL chains-- or when using
+        methods like ``.with_structured_output``, which generate chains under the
+        hood.
+
+        .. code-block:: python
+
+            llm = ChatDatabricks(
+                endpoint="databricks-meta-llama-3-1-405b-instruct",
+                stream_usage=True
+            )
+            structured_llm = llm.with_structured_output(...)
+
     Async:
         .. code-block:: python
 
@@ -180,7 +208,7 @@ class ChatDatabricks(BaseChatModel):
     Tool calling:
         .. code-block:: python
 
-            from langchain_core.pydantic_v1 import BaseModel, Field
+            from pydantic import BaseModel, Field
 
             class GetWeather(BaseModel):
                 '''Get the current weather in a given location'''
@@ -209,7 +237,7 @@ class ChatDatabricks(BaseChatModel):
                 }
             ]
 
-        To use tool calls, your model endpoint must support ``tools`` parameter. See [Function calling on Databricks](https://python.langchain.com/v0.2/docs/integrations/chat/databricks/#function-calling-on-databricks) for more information.
+        To use tool calls, your model endpoint must support ``tools`` parameter. See [Function calling on Databricks](https://python.langchain.com/docs/integrations/chat/databricks/#function-calling-on-databricks) for more information.
 
     """  # noqa: E501
 
@@ -225,13 +253,20 @@ class ChatDatabricks(BaseChatModel):
     """List of strings to stop generation at."""
     max_tokens: Optional[int] = None
     """The maximum number of tokens to generate."""
-    extra_params: dict = Field(default_factory=dict)
+    extra_params: Optional[Dict[str, Any]] = None
+    """Whether to include usage metadata in streaming output. If True, additional
+    message chunks will be generated during the stream including usage metadata.
+    """
+    stream_usage: bool = False
     """Any extra parameters to pass to the endpoint."""
-    _client: Any = PrivateAttr()
+    client: Optional[BaseDeploymentClient] = Field(
+        default=None, exclude=True
+    )  #: :meta private:
 
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
-        self._client = get_deployment_client(self.target_uri)
+        self.client = get_deployment_client(self.target_uri)
+        self.extra_params = self.extra_params or {}
 
     @property
     def _default_params(self) -> Dict[str, Any]:
@@ -254,7 +289,7 @@ class ChatDatabricks(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         data = self._prepare_inputs(messages, stop, **kwargs)
-        resp = self._client.predict(endpoint=self.endpoint, inputs=data)
+        resp = self.client.predict(endpoint=self.endpoint, inputs=data)  # type: ignore
         return self._convert_response_to_chat_result(resp)
 
     def _prepare_inputs(
@@ -267,7 +302,7 @@ class ChatDatabricks(BaseChatModel):
             "messages": [_convert_message_to_dict(msg) for msg in messages],
             "temperature": self.temperature,
             "n": self.n,
-            **self.extra_params,
+            **self.extra_params,  # type: ignore
             **kwargs,
         }
         if stop := self.stop or stop:
@@ -295,11 +330,15 @@ class ChatDatabricks(BaseChatModel):
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
+        *,
+        stream_usage: Optional[bool] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
+        if stream_usage is None:
+            stream_usage = self.stream_usage
         data = self._prepare_inputs(messages, stop, **kwargs)
         first_chunk_role = None
-        for chunk in self._client.predict_stream(endpoint=self.endpoint, inputs=data):
+        for chunk in self.client.predict_stream(endpoint=self.endpoint, inputs=data):  # type: ignore
             if chunk["choices"]:
                 choice = chunk["choices"][0]
 
@@ -307,8 +346,19 @@ class ChatDatabricks(BaseChatModel):
                 if first_chunk_role is None:
                     first_chunk_role = chunk_delta.get("role")
 
+                if stream_usage and (usage := chunk.get("usage")):
+                    input_tokens = usage.get("prompt_tokens", 0)
+                    output_tokens = usage.get("completion_tokens", 0)
+                    usage = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    }
+                else:
+                    usage = None
+
                 chunk_message = _convert_dict_to_message_chunk(
-                    chunk_delta, first_chunk_role
+                    chunk_delta, first_chunk_role, usage=usage
                 )
 
                 generation_info = {}
@@ -367,11 +417,16 @@ class ChatDatabricks(BaseChatModel):
         if tool_choice:
             if isinstance(tool_choice, str):
                 # tool_choice is a tool/function name
-                if tool_choice not in ("auto", "none", "required"):
+                if tool_choice not in ("auto", "none", "required", "any"):
                     tool_choice = {
                         "type": "function",
                         "function": {"name": tool_choice},
                     }
+                # 'any' is not natively supported by OpenAI API,
+                # but supported by other models in Langchain.
+                # Ref: https://github.com/langchain-ai/langchain/blob/202d7f6c4a2ca8c7e5949d935bcf0ba9b0c23fb0/libs/partners/openai/langchain_openai/chat_models/base.py#L1098C1-L1101C45
+                if tool_choice == "any":
+                    tool_choice = "required"
             elif isinstance(tool_choice, dict):
                 tool_names = [
                     formatted_tool["function"]["name"]
@@ -392,6 +447,227 @@ class ChatDatabricks(BaseChatModel):
                 )
             kwargs["tool_choice"] = tool_choice
         return super().bind(tools=formatted_tools, **kwargs)
+
+    def with_structured_output(
+        self,
+        schema: Optional[Union[Dict, Type]] = None,
+        *,
+        method: Literal["function_calling", "json_mode"] = "function_calling",
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
+        """Model wrapper that returns outputs formatted to match the given schema.
+
+        Assumes model is compatible with OpenAI tool-calling API.
+
+        Args:
+            schema: The output schema as a dict or a Pydantic class. If a Pydantic class
+                then the model output will be an object of that class. If a dict then
+                the model output will be a dict. With a Pydantic class the returned
+                attributes will be validated, whereas with a dict they will not be. If
+                `method` is "function_calling" and `schema` is a dict, then the dict
+                must match the OpenAI function-calling spec or be a valid JSON schema
+                with top level 'title' and 'description' keys specified.
+            method: The method for steering model generation, either "function_calling"
+                or "json_mode". If "function_calling" then the schema will be converted
+                to an OpenAI function and the returned model will make use of the
+                function-calling API. If "json_mode" then OpenAI's JSON mode will be
+                used. Note that if using "json_mode" then you must include instructions
+                for formatting the output into the desired schema into the model call.
+            include_raw: If False then only the parsed structured output is returned. If
+                an error occurs during model output parsing it will be raised. If True
+                then both the raw model response (a BaseMessage) and the parsed model
+                response will be returned. If an error occurs during output parsing it
+                will be caught and returned as well. The final output is always a dict
+                with keys "raw", "parsed", and "parsing_error".
+
+        Returns:
+            A Runnable that takes any ChatModel input and returns as output:
+
+            If ``include_raw`` is False and ``schema`` is a Pydantic class, Runnable outputs
+            an instance of ``schema`` (i.e., a Pydantic object).
+
+            Otherwise, if ``include_raw`` is False then Runnable outputs a dict.
+
+            If ``include_raw`` is True, then Runnable outputs a dict with keys:
+                - ``"raw"``: BaseMessage
+                - ``"parsed"``: None if there was a parsing error, otherwise the type depends on the ``schema`` as described above.
+                - ``"parsing_error"``: Optional[BaseException]
+
+        Example: Function-calling, Pydantic schema (method="function_calling", include_raw=False):
+            .. code-block:: python
+
+                from langchain_databricks import ChatDatabricks
+                from pydantic import BaseModel
+
+
+                class AnswerWithJustification(BaseModel):
+                    '''An answer to the user question along with justification for the answer.'''
+
+                    answer: str
+                    justification: str
+
+
+                llm = ChatDatabricks(endpoint="databricks-meta-llama-3-1-70b-instruct")
+                structured_llm = llm.with_structured_output(AnswerWithJustification)
+
+                structured_llm.invoke(
+                    "What weighs more a pound of bricks or a pound of feathers"
+                )
+
+                # -> AnswerWithJustification(
+                #     answer='They weigh the same',
+                #     justification='Both a pound of bricks and a pound of feathers weigh one pound. The weight is the same, but the volume or density of the objects may differ.'
+                # )
+
+        Example: Function-calling, Pydantic schema (method="function_calling", include_raw=True):
+            .. code-block:: python
+
+                from langchain_databricks import ChatDatabricks
+                from pydantic import BaseModel
+
+
+                class AnswerWithJustification(BaseModel):
+                    '''An answer to the user question along with justification for the answer.'''
+
+                    answer: str
+                    justification: str
+
+
+                llm = ChatDatabricks(endpoint="databricks-meta-llama-3-1-70b-instruct")
+                structured_llm = llm.with_structured_output(
+                    AnswerWithJustification, include_raw=True
+                )
+
+                structured_llm.invoke(
+                    "What weighs more a pound of bricks or a pound of feathers"
+                )
+                # -> {
+                #     'raw': AIMessage(content='', additional_kwargs={'tool_calls': [{'id': 'call_Ao02pnFYXD6GN1yzc0uXPsvF', 'function': {'arguments': '{"answer":"They weigh the same.","justification":"Both a pound of bricks and a pound of feathers weigh one pound. The weight is the same, but the volume or density of the objects may differ."}', 'name': 'AnswerWithJustification'}, 'type': 'function'}]}),
+                #     'parsed': AnswerWithJustification(answer='They weigh the same.', justification='Both a pound of bricks and a pound of feathers weigh one pound. The weight is the same, but the volume or density of the objects may differ.'),
+                #     'parsing_error': None
+                # }
+
+        Example: Function-calling, dict schema (method="function_calling", include_raw=False):
+            .. code-block:: python
+
+                from langchain_databricks import ChatDatabricks
+                from langchain_core.utils.function_calling import convert_to_openai_tool
+                from pydantic import BaseModel
+
+
+                class AnswerWithJustification(BaseModel):
+                    '''An answer to the user question along with justification for the answer.'''
+
+                    answer: str
+                    justification: str
+
+
+                dict_schema = convert_to_openai_tool(AnswerWithJustification)
+                llm = ChatDatabricks(endpoint="databricks-meta-llama-3-1-70b-instruct")
+                structured_llm = llm.with_structured_output(dict_schema)
+
+                structured_llm.invoke(
+                    "What weighs more a pound of bricks or a pound of feathers"
+                )
+                # -> {
+                #     'answer': 'They weigh the same',
+                #     'justification': 'Both a pound of bricks and a pound of feathers weigh one pound. The weight is the same, but the volume and density of the two substances differ.'
+                # }
+
+        Example: JSON mode, Pydantic schema (method="json_mode", include_raw=True):
+            .. code-block::
+
+                from langchain_databricks import ChatDatabricks
+                from pydantic import BaseModel
+
+                class AnswerWithJustification(BaseModel):
+                    answer: str
+                    justification: str
+
+                llm = ChatDatabricks(endpoint="databricks-meta-llama-3-1-70b-instruct")
+                structured_llm = llm.with_structured_output(
+                    AnswerWithJustification,
+                    method="json_mode",
+                    include_raw=True
+                )
+
+                structured_llm.invoke(
+                    "Answer the following question. "
+                    "Make sure to return a JSON blob with keys 'answer' and 'justification'.\n\n"
+                    "What's heavier a pound of bricks or a pound of feathers?"
+                )
+                # -> {
+                #     'raw': AIMessage(content='{\n    "answer": "They are both the same weight.",\n    "justification": "Both a pound of bricks and a pound of feathers weigh one pound. The difference lies in the volume and density of the materials, not the weight." \n}'),
+                #     'parsed': AnswerWithJustification(answer='They are both the same weight.', justification='Both a pound of bricks and a pound of feathers weigh one pound. The difference lies in the volume and density of the materials, not the weight.'),
+                #     'parsing_error': None
+                # }
+
+        Example: JSON mode, no schema (schema=None, method="json_mode", include_raw=True):
+            .. code-block::
+
+                structured_llm = llm.with_structured_output(method="json_mode", include_raw=True)
+
+                structured_llm.invoke(
+                    "Answer the following question. "
+                    "Make sure to return a JSON blob with keys 'answer' and 'justification'.\n\n"
+                    "What's heavier a pound of bricks or a pound of feathers?"
+                )
+                # -> {
+                #     'raw': AIMessage(content='{\n    "answer": "They are both the same weight.",\n    "justification": "Both a pound of bricks and a pound of feathers weigh one pound. The difference lies in the volume and density of the materials, not the weight." \n}'),
+                #     'parsed': {
+                #         'answer': 'They are both the same weight.',
+                #         'justification': 'Both a pound of bricks and a pound of feathers weigh one pound. The difference lies in the volume and density of the materials, not the weight.'
+                #     },
+                #     'parsing_error': None
+                # }
+
+
+        """  # noqa: E501
+        if kwargs:
+            raise ValueError(f"Received unsupported arguments {kwargs}")
+        is_pydantic_schema = isinstance(schema, type) and is_basemodel_subclass(schema)
+        if method == "function_calling":
+            if schema is None:
+                raise ValueError(
+                    "schema must be specified when method is 'function_calling'. "
+                    "Received None."
+                )
+            tool_name = convert_to_openai_tool(schema)["function"]["name"]
+            llm = self.bind_tools([schema], tool_choice=tool_name)
+            if is_pydantic_schema:
+                output_parser: OutputParserLike = PydanticToolsParser(
+                    tools=[schema],  # type: ignore[list-item]
+                    first_tool_only=True,  # type: ignore[list-item]
+                )
+            else:
+                output_parser = JsonOutputKeyToolsParser(
+                    key_name=tool_name, first_tool_only=True
+                )
+        elif method == "json_mode":
+            llm = self.bind(response_format={"type": "json_object"})
+            output_parser = (
+                PydanticOutputParser(pydantic_object=schema)  # type: ignore[arg-type]
+                if is_pydantic_schema
+                else JsonOutputParser()
+            )
+        else:
+            raise ValueError(
+                f"Unrecognized method argument. Expected one of 'function_calling' or "
+                f"'json_mode'. Received: '{method}'"
+            )
+
+        if include_raw:
+            parser_assign = RunnablePassthrough.assign(
+                parsed=itemgetter("raw") | output_parser, parsing_error=lambda _: None
+            )
+            parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
+            parser_with_fallback = parser_assign.with_fallbacks(
+                [parser_none], exception_key="parsing_error"
+            )
+            return RunnableMap(raw=llm) | parser_with_fallback
+        else:
+            return llm | output_parser
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -418,9 +694,11 @@ class ChatDatabricks(BaseChatModel):
 def _convert_message_to_dict(message: BaseMessage) -> dict:
     message_dict = {"content": message.content}
 
-    # OpenAI supports "name" field in messages.
-    if (name := message.name or message.additional_kwargs.get("name")) is not None:
-        message_dict["name"] = name
+    # NB: We don't propagate 'name' field from input message to the endpoint because
+    #  FMAPI doesn't support it. We should update the endpoints to be compatible with
+    #  OpenAI and then we can uncomment the following code.
+    # if (name := message.name or message.additional_kwargs.get("name")) is not None:
+    #     message_dict["name"] = name
 
     if isinstance(message, ChatMessage):
         return {"role": message.role, **message_dict}
@@ -525,7 +803,9 @@ def _convert_dict_to_message(_dict: Dict) -> BaseMessage:
 
 
 def _convert_dict_to_message_chunk(
-    _dict: Mapping[str, Any], default_role: str
+    _dict: Mapping[str, Any],
+    default_role: str,
+    usage: Optional[Dict[str, Any]] = None,
 ) -> BaseMessageChunk:
     role = _dict.get("role", default_role)
     content = _dict.get("content")
@@ -556,11 +836,13 @@ def _convert_dict_to_message_chunk(
                 ]
             except KeyError:
                 pass
+        usage_metadata = UsageMetadata(**usage) if usage else None  # type: ignore
         return AIMessageChunk(
             content=content,
             additional_kwargs=additional_kwargs,
             id=_dict.get("id"),
             tool_call_chunks=tool_call_chunks,
+            usage_metadata=usage_metadata,
         )
     else:
         return ChatMessageChunk(content=content, role=role)

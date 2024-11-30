@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from enum import Enum
 from functools import partial
@@ -36,6 +37,7 @@ _DIRECT_ACCESS_ONLY_MSG = "`%s` is only supported for direct-access index."
 _NON_MANAGED_EMB_ONLY_MSG = (
     "`%s` is not supported for index with Databricks-managed embeddings."
 )
+_INDEX_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$")
 
 
 class DatabricksVectorSearch(VectorStore):
@@ -60,8 +62,23 @@ class DatabricksVectorSearch(VectorStore):
 
     Key init args — indexing params:
 
-        endpoint: The name of the Databricks Vector Search endpoint.
         index_name: The name of the index to use. Format: "catalog.schema.index".
+        endpoint: The name of the Databricks Vector Search endpoint. If not specified,
+            the endpoint name is automatically inferred based on the index name.
+
+            .. note::
+
+                If you are using `databricks-vectorsearch` version < 0.35, the `endpoint` parameter
+                is required when initializing the vector store.
+
+                .. code-block:: python
+
+                    vector_store = DatabricksVectorSearch(
+                        endpoint="<your-endpoint-name>",
+                        index_name="<your-index-name>",
+                        ...
+                    )
+
         embedding: The embedding model.
                   Required for direct-access index or delta-sync index
                   with self-managed embeddings.
@@ -89,7 +106,6 @@ class DatabricksVectorSearch(VectorStore):
             from langchain_databricks.vectorstores import DatabricksVectorSearch
 
             vector_store = DatabricksVectorSearch(
-                endpoint="<your-endpoint-name>",
                 index_name="<your-index-name>"
             )
 
@@ -102,7 +118,6 @@ class DatabricksVectorSearch(VectorStore):
             from langchain_openai import OpenAIEmbeddings
 
             vector_store = DatabricksVectorSearch(
-                endpoint="<your-endpoint-name>",
                 index_name="<your-index-name>",
                 embedding=OpenAIEmbeddings(),
                 text_column="document_content"
@@ -196,12 +211,18 @@ class DatabricksVectorSearch(VectorStore):
 
     def __init__(
         self,
-        endpoint: str,
         index_name: str,
+        endpoint: Optional[str] = None,
         embedding: Optional[Embeddings] = None,
         text_column: Optional[str] = None,
         columns: Optional[List[str]] = None,
     ):
+        if not (isinstance(index_name, str) and _INDEX_NAME_PATTERN.match(index_name)):
+            raise ValueError(
+                "The `index_name` parameter must be a string in the format "
+                f"'catalog.schema.index'. Received: {index_name}"
+            )
+
         try:
             from databricks.vector_search.client import (  # type: ignore[import]
                 VectorSearchClient,
@@ -212,7 +233,21 @@ class DatabricksVectorSearch(VectorStore):
                 "Please install it with `pip install databricks-vectorsearch`."
             ) from e
 
-        self.index = VectorSearchClient().get_index(endpoint, index_name)
+        try:
+            self.index = VectorSearchClient().get_index(
+                endpoint_name=endpoint, index_name=index_name
+            )
+        except Exception as e:
+            if endpoint is None and "Wrong vector search endpoint" in str(e):
+                raise ValueError(
+                    "The `endpoint` parameter is required for instantiating "
+                    "DatabricksVectorSearch with the `databricks-vectorsearch` "
+                    "version earlier than 0.35. Please provide the endpoint "
+                    "name or upgrade to version 0.35 or later."
+                ) from e
+            else:
+                raise
+
         self._index_details = IndexDetails(self.index)
 
         _validate_embedding(embedding, self._index_details)
