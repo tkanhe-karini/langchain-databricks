@@ -4,6 +4,7 @@ from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
+from databricks.vector_search.client import VectorSearchIndex  # type: ignore
 from langchain_core.embeddings import Embeddings
 
 from langchain_databricks.vectorstores import DatabricksVectorSearch
@@ -65,9 +66,9 @@ EXAMPLE_SEARCH_RESPONSE = {
 ### Dummy Indices ####
 
 ENDPOINT_NAME = "test-endpoint"
-DIRECT_ACCESS_INDEX = "test-direct-access-index"
-DELTA_SYNC_INDEX = "test-delta-sync-index"
-DELTA_SYNC_SELF_MANAGED_EMBEDDINGS_INDEX = "test-delta-sync-self-managed-index"
+DIRECT_ACCESS_INDEX = "test.direct_access.index"
+DELTA_SYNC_INDEX = "test.delta_sync.index"
+DELTA_SYNC_SELF_MANAGED_EMBEDDINGS_INDEX = "test.delta_sync_self_managed.index"
 ALL_INDEX_NAMES = {
     DIRECT_ACCESS_INDEX,
     DELTA_SYNC_INDEX,
@@ -133,12 +134,10 @@ INDEX_DETAILS = {
 
 @pytest.fixture(autouse=True)
 def mock_vs_client() -> Generator:
-    def _get_index(endpoint: str, index_name: str) -> MagicMock:
-        from databricks.vector_search.client import VectorSearchIndex  # type: ignore
-
-        if endpoint != ENDPOINT_NAME:
-            raise ValueError(f"Unknown endpoint: {endpoint}")
-
+    def _get_index(
+        endpoint_name: Optional[str] = None,
+        index_name: str = None,  # type: ignore
+    ) -> MagicMock:
         index = MagicMock(spec=VectorSearchIndex)
         index.describe.return_value = INDEX_DETAILS[index_name]
         index.similarity_search.return_value = EXAMPLE_SEARCH_RESPONSE
@@ -157,7 +156,6 @@ def init_vector_search(
     index_name: str, columns: Optional[List[str]] = None
 ) -> DatabricksVectorSearch:
     kwargs: Dict[str, Any] = {
-        "endpoint": ENDPOINT_NAME,
         "index_name": index_name,
         "columns": columns,
     }
@@ -177,10 +175,25 @@ def test_init(index_name: str) -> None:
     assert vectorsearch.index.describe() == INDEX_DETAILS[index_name]
 
 
+def test_init_with_endpoint_name() -> None:
+    vectorsearch = DatabricksVectorSearch(
+        endpoint=ENDPOINT_NAME,
+        index_name=DELTA_SYNC_INDEX,
+    )
+    assert vectorsearch.index.describe() == INDEX_DETAILS[DELTA_SYNC_INDEX]
+
+
+@pytest.mark.parametrize(
+    "index_name", [None, "invalid", 123, MagicMock(spec=VectorSearchIndex)]
+)
+def test_init_fail_invalid_index_name(index_name) -> None:
+    with pytest.raises(ValueError, match="The `index_name` parameter must be"):
+        DatabricksVectorSearch(index_name=index_name)
+
+
 def test_init_fail_text_column_mismatch() -> None:
     with pytest.raises(ValueError, match=f"The index '{DELTA_SYNC_INDEX}' has"):
         DatabricksVectorSearch(
-            endpoint=ENDPOINT_NAME,
             index_name=DELTA_SYNC_INDEX,
             text_column="some_other_column",
         )
@@ -190,7 +203,6 @@ def test_init_fail_text_column_mismatch() -> None:
 def test_init_fail_no_text_column(index_name: str) -> None:
     with pytest.raises(ValueError, match="The `text_column` parameter is required"):
         DatabricksVectorSearch(
-            endpoint=ENDPOINT_NAME,
             index_name=index_name,
             embedding=EMBEDDING_MODEL,
         )
@@ -206,7 +218,6 @@ def test_init_fail_columns_not_in_schema() -> None:
 def test_init_fail_no_embedding(index_name: str) -> None:
     with pytest.raises(ValueError, match="The `embedding` parameter is required"):
         DatabricksVectorSearch(
-            endpoint=ENDPOINT_NAME,
             index_name=index_name,
             text_column="text",
         )
@@ -215,7 +226,6 @@ def test_init_fail_no_embedding(index_name: str) -> None:
 def test_init_fail_embedding_already_specified_in_source() -> None:
     with pytest.raises(ValueError, match=f"The index '{DELTA_SYNC_INDEX}' uses"):
         DatabricksVectorSearch(
-            endpoint=ENDPOINT_NAME,
             index_name=DELTA_SYNC_INDEX,
             embedding=EMBEDDING_MODEL,
         )
@@ -227,7 +237,6 @@ def test_init_fail_embedding_dim_mismatch(index_name: str) -> None:
         ValueError, match="embedding model's dimension '1000' does not match"
     ):
         DatabricksVectorSearch(
-            endpoint=ENDPOINT_NAME,
             index_name=index_name,
             text_column="text",
             embedding=FakeEmbeddings(1000),

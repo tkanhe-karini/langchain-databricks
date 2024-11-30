@@ -54,7 +54,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
       - name: Upload build
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
@@ -157,9 +157,10 @@ jobs:
         run: make tests
         working-directory: ${{ inputs.working-directory }}
 
-      - name: Run integration tests
-        run: make integration_tests
-        working-directory: ${{ inputs.working-directory }}
+      # Integration test is executed nightly in the separate private repository.
+      # - name: Run integration tests
+      #   run: make integration_tests
+      #   working-directory: ${{ inputs.working-directory }}
 
       - name: Get minimum versions
         working-directory: ${{ inputs.working-directory }}
@@ -208,7 +209,7 @@ jobs:
           working-directory: ${{ inputs.working-directory }}
           cache-key: release
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
@@ -219,6 +220,8 @@ jobs:
           packages-dir: ${{ inputs.working-directory }}/dist/
           verbose: true
           print-hash: true
+          # Temp workaround since attestations are on by default as of gh-action-pypi-publish v1\.11\.0
+          attestations: false
 
   mark-release:
     needs:
@@ -245,9 +248,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           poetry-version: ${{ env.POETRY_VERSION }}
           working-directory: ${{ inputs.working-directory }}
-          cache-key: release
+          cache-key: releaseartifact@v4
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
