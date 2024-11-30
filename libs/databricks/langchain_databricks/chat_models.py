@@ -312,9 +312,7 @@ class ChatDatabricks(BaseChatModel):
 
         return data
 
-    def _convert_response_to_chat_result(
-        self, response: Mapping[str, Any]
-    ) -> ChatResult:
+    def _convert_response_to_chat_result(self, response: Mapping[str, Any]) -> ChatResult:
         generations = [
             ChatGeneration(
                 message=_convert_dict_to_message(choice["message"]),
@@ -364,17 +362,18 @@ class ChatDatabricks(BaseChatModel):
                 generation_info = {}
                 if finish_reason := choice.get("finish_reason"):
                     generation_info["finish_reason"] = finish_reason
+                    # Azure openai does not provide usage metadata for streaming
+                    try:
+                        generation_info["usage_metadata"] = chunk["usage"]
+                    except:
+                        pass
                 if logprobs := choice.get("logprobs"):
                     generation_info["logprobs"] = logprobs
 
-                chunk = ChatGenerationChunk(
-                    message=chunk_message, generation_info=generation_info or None
-                )
+                chunk = ChatGenerationChunk(message=chunk_message, generation_info=generation_info or None)
 
                 if run_manager:
-                    run_manager.on_llm_new_token(
-                        chunk.text, chunk=chunk, logprobs=logprobs
-                    )
+                    run_manager.on_llm_new_token(chunk.text, chunk=chunk, logprobs=logprobs)
 
                 yield chunk
             else:
@@ -385,9 +384,7 @@ class ChatDatabricks(BaseChatModel):
         self,
         tools: Sequence[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
         *,
-        tool_choice: Optional[
-            Union[dict, str, Literal["auto", "none", "required", "any"], bool]
-        ] = None,
+        tool_choice: Optional[Union[dict, str, Literal["auto", "none", "required", "any"], bool]] = None,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, BaseMessage]:
         """Bind tool-like objects to this chat model.
@@ -428,23 +425,11 @@ class ChatDatabricks(BaseChatModel):
                 if tool_choice == "any":
                     tool_choice = "required"
             elif isinstance(tool_choice, dict):
-                tool_names = [
-                    formatted_tool["function"]["name"]
-                    for formatted_tool in formatted_tools
-                ]
-                if not any(
-                    tool_name == tool_choice["function"]["name"]
-                    for tool_name in tool_names
-                ):
-                    raise ValueError(
-                        f"Tool choice {tool_choice} was specified, but the only "
-                        f"provided tools were {tool_names}."
-                    )
+                tool_names = [formatted_tool["function"]["name"] for formatted_tool in formatted_tools]
+                if not any(tool_name == tool_choice["function"]["name"] for tool_name in tool_names):
+                    raise ValueError(f"Tool choice {tool_choice} was specified, but the only " f"provided tools were {tool_names}.")
             else:
-                raise ValueError(
-                    f"Unrecognized tool_choice type. Expected str, bool or dict. "
-                    f"Received: {tool_choice}"
-                )
+                raise ValueError(f"Unrecognized tool_choice type. Expected str, bool or dict. " f"Received: {tool_choice}")
             kwargs["tool_choice"] = tool_choice
         return super().bind(tools=formatted_tools, **kwargs)
 
@@ -673,9 +658,7 @@ class ChatDatabricks(BaseChatModel):
     def _identifying_params(self) -> Dict[str, Any]:
         return self._default_params
 
-    def _get_invocation_params(
-        self, stop: Optional[List[str]] = None, **kwargs: Any
-    ) -> Dict[str, Any]:
+    def _get_invocation_params(self, stop: Optional[List[str]] = None, **kwargs: Any) -> Dict[str, Any]:
         """Get the parameters used to invoke the model FOR THE CALLBACKS."""
         return {
             **self._default_params,
@@ -718,13 +701,9 @@ def _convert_message_to_dict(message: BaseMessage) -> dict:
             "tool_call_id": message.tool_call_id,
             **message_dict,
         }
-    elif (
-        isinstance(message, FunctionMessage)
-        or "function_call" in message.additional_kwargs
-    ):
+    elif isinstance(message, FunctionMessage) or "function_call" in message.additional_kwargs:
         raise ValueError(
-            "Function messages are not supported by Databricks. Please"
-            " create a feature request at https://github.com/mlflow/mlflow/issues."
+            "Function messages are not supported by Databricks. Please" " create a feature request at https://github.com/mlflow/mlflow/issues."
         )
     else:
         raise ValueError(f"Got unknown message type: {type(message)}")
@@ -788,9 +767,7 @@ def _convert_dict_to_message(_dict: Dict) -> BaseMessage:
                 try:
                     tool_calls.append(parse_tool_call(raw_tool_call, return_id=True))
                 except Exception as e:
-                    invalid_tool_calls.append(
-                        make_invalid_tool_call(raw_tool_call, str(e))
-                    )
+                    invalid_tool_calls.append(make_invalid_tool_call(raw_tool_call, str(e)))
         return AIMessage(
             content=content,
             additional_kwargs=additional_kwargs,
@@ -807,6 +784,7 @@ def _convert_dict_to_message_chunk(
     default_role: str,
     usage: Optional[Dict[str, Any]] = None,
 ) -> BaseMessageChunk:
+
     role = _dict.get("role", default_role)
     content = _dict.get("content")
     content = content if content is not None else ""
@@ -816,9 +794,7 @@ def _convert_dict_to_message_chunk(
     elif role == "system":
         return SystemMessageChunk(content=content)
     elif role == "tool":
-        return ToolMessageChunk(
-            content=content, tool_call_id=_dict["tool_call_id"], id=_dict.get("id")
-        )
+        return ToolMessageChunk(content=content, tool_call_id=_dict["tool_call_id"], id=_dict.get("id"))
     elif role == "assistant":
         additional_kwargs: Dict = {}
         tool_call_chunks = []
